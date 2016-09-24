@@ -659,9 +659,12 @@ const struct timespec *abs_timeout)
             sigev = &mqhdr->mqh_event;
 #if !defined(WIN32)
             if (sigev->sigev_notify == SIGEV_SIGNAL) {
-                /*sigqueue(mqhdr->mqh_pid, sigev->sigev_signo,
-                                         sigev->sigev_value);*/
+#ifdef __APPLE__
                 kill(mqhdr->mqh_pid, sigev->sigev_signo);
+#else
+                sigqueue(mqhdr->mqh_pid, sigev->sigev_signo,
+                                         sigev->sigev_value);
+#endif
             }
 #endif
             mqhdr->mqh_pid = 0;             /* unregister */
