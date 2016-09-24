@@ -10,9 +10,20 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
-#if defined(WIN32)
-#   include <io.h>
+#include <limits.h> // PATH_MAX
+
+#if defined(WIN32) || defined(__APPLE__)
+#include <string.h> // strlen
 #endif
+
+#if defined(WIN32)
+    #include <io.h> // _lseek, etc
+#else
+    #include <sys/mman.h>
+    #include <unistd.h>  // lseek, etc
+    #include <signal.h> // kill
+#endif
+
 #include "mqueue.h"
 
 #if defined(WIN32)
@@ -22,8 +33,16 @@
     typedef unsigned short mode_t;
 #endif
 
+//#define POSIX_IPC_DEBUG
+#ifdef POSIX_IPC_DEBUG
+#define DPRINTF(fmt, args...) fprintf(stderr, "+++ " fmt, ## args)
+#else
+#define DPRINTF(fmt, args...)
+#endif
+
 #ifdef WIN32
-int MUTEX_LOCK(struct mq_hdr* hdr) 
+/* TODO: these should be setting errno appropriately like the pthread methods */
+int MUTEX_LOCK(struct mq_hdr* hdr)
 {
 	DWORD dwWaitResult = WaitForSingleObject( 
 		hdr->mqh_lock,    // handle to mutex
@@ -44,41 +63,77 @@ int MUTEX_LOCK(struct mq_hdr* hdr)
     }
 }
 
+/* Returns 0 on success */
 int COND_WAIT(struct mq_hdr* hdr)
 {
+	DWORD dwWaitResult;
+
 	ReleaseMutex(hdr->mqh_lock);
-	WaitForSingleObject(hdr->mqh_wait, INFINITE);
+	dwWaitResult = WaitForSingleObject(hdr->mqh_wait, INFINITE);
+	if(dwWaitResult != WAIT_OBJECT_0) {
+		return EINVAL;
+	}
+
 	return MUTEX_LOCK(hdr);
 }
+
+/* Returns 0 on success */
 int COND_TIMED_WAIT(struct mq_hdr* hdr, const struct timespec* abstime)
 {
 	DWORD dwWaitResult;
 
 	ReleaseMutex(hdr->mqh_lock);
 	dwWaitResult = WaitForSingleObject(hdr->mqh_wait, (DWORD) abstime->tv_sec);
-	WaitForSingleObject(hdr->mqh_lock,(DWORD) abstime->tv_sec);
- 
-    return dwWaitResult == WAIT_OBJECT_0;
+	switch(dwWaitResult) {
+	    case WAIT_OBJECT_0:
+	        break
+	    case WAIT_TIMEOUT:
+	        return ETIMEDOUT;
+	    default:
+	        return EINVAL;
+	}
+
+	dwWaitResult = WaitForSingleObject(hdr->mqh_lock,(DWORD) abstime->tv_sec);
+	if(dwWaitResult == WAIT_OBJECT_0) {
+	    return 0;
+	}
+
+    if(dwWaitResult == WAIT_TIMEOUT) {
+        return ETIMEDOUT;
+    }
+
+    return EINVAL;
 }
+
+/* Returns 0 on success */
 int COND_SIGNAL(struct mq_hdr* hdr)
 {
-	SetEvent(hdr->mqh_wait);
-	return 0;
+	BOOL result = SetEvent(hdr->mqh_wait);
+	return result == 0;
 }
 void MUTEX_UNLOCK(struct mq_hdr* hdr)
 {
 	ReleaseMutex(hdr->mqh_lock);
 }
+
+#define open _open
+#define close _close
+#define unlink _unlink
+#define lseek _lseek
+#define write _write
 #else
+#define INFINITE -1
 #define MUTEX_LOCK(x)   pthread_mutex_lock(&x->mqh_lock)
 #define MUTEX_UNLOCK(x) pthread_mutex_unlock(&x->mqh_lock)
-##define COND_WAIT(x,y) pthread_cond_wait(&x->mqh_wait, &x->mqh_lock)
-#define COND_SIGNAL(x)  phtread_cond_signal(&x->mqh_wait)
+#define COND_WAIT(x)  pthread_cond_wait(&x->mqh_wait, &x->mqh_lock)
+#define COND_TIMED_WAIT(x, y) pthread_cond_timedwait(&x->mqh_wait, &x->mqh_lock, y)
+#define COND_SIGNAL(x)  pthread_cond_signal(&x->mqh_wait)
 #endif
 
 
 #define MAX_TRIES   10
 struct mq_attr defattr = { 0, 128, 1024, 0 };
+
 
 int mq_close(mqd_t mqd)
 {
@@ -180,13 +235,34 @@ int mq_notify(mqd_t mqd, const struct sigevent *notification)
     return(0);
 
 err:
-    MUTEX_UNLOCK(&mqhdr->mqh_lock);
+    MUTEX_UNLOCK(mqhdr);
     return(-1);
 #else
     errno = ENOSYS;
     return(-1);
 #endif
 }
+
+/* These end with a slash */
+#ifdef WIN32
+#define TMP_ENV_NAME "TEMP"
+#else
+#define TMP_ENV_NAME "TMPDIR"
+#endif
+
+#if defined(WIN32) || defined(__APPLE__)
+int get_temp_path(char* pathBuffer, int pathBufferSize, const char* pathPart) {
+	const char* temp = getenv(TMP_ENV_NAME);
+	if(strlen(temp) >= pathBufferSize - strlen(pathPart)) {
+		return 0;
+	}
+
+	/* We've done the size check above so we don't need to use the string safe methods */
+	strcpy(pathBuffer, temp);
+	strcat(pathBuffer, pathPart);
+	return 1;
+}
+#endif
 
 mqd_t mq_open(const char *pathname1, int oflag, ...)
 {
@@ -200,32 +276,39 @@ mqd_t mq_open(const char *pathname1, int oflag, ...)
     struct msg_hdr      *msghdr;
     struct mq_attr      *attr =  NULL;
     struct mq_info      *mqinfo;
-#if  defined(WIN32)
-	char pathBuffer[256];
+
+#if  defined(WIN32) || defined(__APPLE__)
+	char pathBuffer[PATH_MAX];
 #else
-	char* pathBuffer;
+	const char* pathBuffer;
+#endif
+
+#ifndef WIN32
     pthread_mutexattr_t  mattr;
     pthread_condattr_t   cattr;
 #endif
-#if defined(WIN32)
+
+#ifdef WIN32
     HANDLE fmap = NULL;
 
     mptr = NULL;
 #else
     mptr = (char *) MAP_FAILED;
 #endif
+
     created = 0;
     nonblock = oflag & O_NONBLOCK;
     oflag &= ~O_NONBLOCK;
     mqinfo = NULL;
-	#ifdef WIN32
+
+#if defined(WIN32) || defined(__APPLE__)
 	{
-		char* temp = getenv("TEMP");
-		strcpy(pathBuffer,temp);
-		strcat(pathBuffer,pathname1);
+		if(!get_temp_path(pathBuffer, sizeof(pathBuffer), pathname1)) {
+			return((mqd_t) -1);
+		}
 	}
 #else
-	pathBuffer = pathname1;
+	pathBuffer = (char*)pathname1;
 #endif
 
 again:
@@ -235,10 +318,9 @@ again:
         attr = va_arg(ap, struct mq_attr *);
         va_end(ap);
 
-
         /* open and specify O_EXCL and user-execute */
 		oflag &= ~3; // strip off RDONLY, WRONLY or RDWR bits
-        fd = _open(pathBuffer, oflag | O_EXCL | O_RDWR, mode | S_IXUSR);
+        fd = open(pathBuffer, oflag | O_EXCL | O_RDWR, mode | S_IXUSR);
         if (fd < 0) {
             if (errno == EEXIST && (oflag & O_EXCL) == 0)
                 goto exists;            /* already exists, OK */
@@ -259,9 +341,9 @@ again:
             msgsize = MSGSIZE(attr->mq_msgsize);
             filesize = sizeof(struct mq_hdr) + (attr->mq_maxmsg *
                                (sizeof(struct msg_hdr) + msgsize));
-            if (_lseek(fd, filesize - 1, SEEK_SET) == -1)
+            if (lseek(fd, filesize - 1, SEEK_SET) == -1)
                 goto err;
-            if (_write(fd, "", 1) == -1)
+            if (write(fd, "", 1) == -1)
                 goto err;
 
             /* memory map the file */
@@ -366,12 +448,12 @@ again:
             if (fchmod(fd, mode) == -1)
 #endif
                 goto err;
-            _close(fd);
+            close(fd);
             return((mqd_t) mqinfo);
     }
 exists:
     /* open the file then memory map */
-    if ( (fd = _open(pathBuffer, O_RDWR)) < 0) {
+    if ( (fd = open(pathBuffer, O_RDWR)) < 0) {
         if (errno == ENOENT && (oflag & O_CREAT))
             goto again;
         goto err;
@@ -381,7 +463,7 @@ exists:
     for (i = 0; i < MAX_TRIES; i++) {
         if (stat(pathBuffer, &statbuff) == -1) {
             if (errno == ENOENT && (oflag & O_CREAT)) {
-                _close(fd);
+                close(fd);
                 goto again;
             }
             goto err;
@@ -408,7 +490,7 @@ exists:
     if (mptr == MAP_FAILED)
 #endif
         goto err;
-    _close(fd);
+    close(fd);
 
     /* allocate one mq_info{} for each open */
     if ( (mqinfo = malloc(sizeof(struct mq_info))) == NULL)
@@ -425,7 +507,7 @@ err:
     /* don't let following function calls change errno */
     save_errno = errno;
     if (created)
-        _unlink(pathBuffer);
+        unlink(pathBuffer);
 #if defined(WIN32)
     if (fmap != NULL) {
         if (mptr != NULL) {
@@ -440,7 +522,7 @@ err:
     if (mqinfo != NULL)
         free(mqinfo);
 	if (fd !=-1)
-		_close(fd);
+		close(fd);
     errno = save_errno;
     return((mqd_t) -1);
 }
@@ -477,33 +559,36 @@ ssize_t  mq_timedreceive(mqd_t mqd, char *ptr,
         errno = EMSGSIZE;
         goto err;
     }
+
     if (attr->mq_curmsgs == 0) {            /* queue is empty */
         if (mqinfo->mqi_flags & O_NONBLOCK) {
             errno = EAGAIN;
             goto err;
         }
+
         /* wait for a message to be placed onto queue */
         mqhdr->mqh_nwait++;
         while (attr->mq_curmsgs == 0)
 		{
-			if (abs_timeout->tv_sec == INFINITE)
-			{
-				COND_WAIT(mqhdr);
+			if (abs_timeout->tv_sec == INFINITE) {
+				n = COND_WAIT(mqhdr);
 			}
-			else
-			{
-				if (COND_TIMED_WAIT(mqhdr,abs_timeout) == 0)
-				{
-			        mqhdr->mqh_nwait--;
-					goto err;
-				}
+			else {
+			    n = COND_TIMED_WAIT(mqhdr, abs_timeout);
 			}
+
+            if(n != 0) {
+                errno = n;
+                mqhdr->mqh_nwait--;
+                goto err;
+            }
 		}
+
         mqhdr->mqh_nwait--;
     }
 
-    if ( (index = mqhdr->mqh_head) == 0) {
-        fprintf(stderr, "mq_receive: curmsgs = %ld; head = 0",attr->mq_curmsgs);
+    if ((index = mqhdr->mqh_head) == 0) {
+        DPRINTF("mq_receive: curmsgs = %ld; head = 0\n", attr->mq_curmsgs);
         abort();
     }
 
@@ -540,7 +625,8 @@ ssize_t mq_receive(mqd_t mqd, char *ptr, size_t maxlen, unsigned int *priop)
 }
 
 
-int mq_send(mqd_t mqd, const char *ptr, size_t len, unsigned int prio)
+int mq_timedsend(mqd_t mqd, const char *ptr, size_t len, unsigned int prio,
+const struct timespec *abs_timeout)
 {
     int              n;
     long             index, freeindex;
@@ -573,8 +659,9 @@ int mq_send(mqd_t mqd, const char *ptr, size_t len, unsigned int prio)
             sigev = &mqhdr->mqh_event;
 #if !defined(WIN32)
             if (sigev->sigev_notify == SIGEV_SIGNAL) {
-                sigqueue(mqhdr->mqh_pid, sigev->sigev_signo,
-                                         sigev->sigev_value);
+                /*sigqueue(mqhdr->mqh_pid, sigev->sigev_signo,
+                                         sigev->sigev_value);*/
+                kill(mqhdr->mqh_pid, sigev->sigev_signo);
             }
 #endif
             mqhdr->mqh_pid = 0;             /* unregister */
@@ -585,13 +672,27 @@ int mq_send(mqd_t mqd, const char *ptr, size_t len, unsigned int prio)
             errno = EAGAIN;
             goto err;
         }
+
         /* wait for room for one message on the queue */
-        while (attr->mq_curmsgs >= attr->mq_maxmsg)
-            COND_WAIT(mqhdr);
+        while (attr->mq_curmsgs >= attr->mq_maxmsg) {
+			if (abs_timeout->tv_sec == INFINITE) {
+				n = COND_WAIT(mqhdr);
+			}
+			else {
+			    n = COND_TIMED_WAIT(mqhdr, abs_timeout);
+			}
+
+            DPRINTF("n: %d\n", n);
+            if (n != 0) {
+                errno = n;
+                goto err;
+            }
+		}
     }
+
     /* nmsghdr will point to new message */
     if ( (freeindex = mqhdr->mqh_free) == 0) {
-        fprintf(stderr, "mq_send: curmsgs = %ld; free = 0", attr->mq_curmsgs);
+        DPRINTF("mq_send: curmsgs = %ld; free = 0\n", attr->mq_curmsgs);
     }
 
     nmsghdr = (struct msg_hdr *) &mptr[freeindex];
@@ -631,6 +732,15 @@ err:
     return(-1);
 }
 
+
+int mq_send(mqd_t mqd, const char *ptr, size_t len, unsigned int prio)
+{
+	struct timespec abstime;
+	abstime.tv_sec = INFINITE;
+	abstime.tv_nsec = INFINITE;
+    return mq_timedsend(mqd, ptr, len, prio, &abstime);
+}
+
 int mq_setattr(mqd_t mqd, const struct mq_attr *mqstat, struct mq_attr *omqstat)
 {
     int             n;
@@ -668,19 +778,18 @@ int mq_setattr(mqd_t mqd, const struct mq_attr *mqstat, struct mq_attr *omqstat)
 
 int mq_unlink(const char *pathname1)
 {
+#if defined(WIN32) || defined(__APPLE__)
+	char pathname[PATH_MAX];
 
-#ifdef WIN32
-	char pathname[256];
-	{
-		char* temp = getenv("TEMP");
-		strcpy(pathname,temp);
-		strcat(pathname,pathname1);
+	if(!get_temp_path(pathname, sizeof(pathname), pathname1)) {
+		return(-1);
 	}
 #else
-	char* pathname = pathname1;
+	const char* pathname = pathname1;
 #endif
 
-    if (_unlink(pathname) == -1)
+    if (unlink(pathname) == -1)
         return(-1);
+
     return(0);
 }

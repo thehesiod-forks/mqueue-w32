@@ -89,13 +89,12 @@ extern int     mq_getattr(mqd_t, struct mq_attr *);
 extern int     mq_notify(mqd_t, const struct sigevent *);
 extern mqd_t   mq_open(const char *, int, ...);
 extern ssize_t mq_receive(mqd_t, char *, size_t, unsigned int *);
+extern ssize_t mq_timedreceive(mqd_t, char *, size_t, unsigned int *, const struct timespec *);
 extern int     mq_send(mqd_t, const char *, size_t, unsigned int);
+int            mq_timedsend(mqd_t mqd, const char *ptr, size_t len, unsigned int prio, const struct timespec *abs_timeout);
 extern int     mq_setattr(mqd_t, const struct mq_attr *, struct mq_attr *);
 extern int     mq_unlink(const char *name);
 
-ssize_t        mq_timedreceive(mqd_t mqdes, char *msg_ptr,
-                               size_t msg_len, unsigned int *msg_prio,
-                               const struct timespec *abs_timeout);
 #ifdef __cplusplus
 }
 #endif
