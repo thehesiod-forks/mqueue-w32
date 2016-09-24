@@ -228,6 +228,12 @@ int mq_notify(mqd_t mqd, const struct sigevent *notification)
                 goto err;
             }
         }
+
+        if(notification->sigev_notify == SIGEV_THREAD) {
+            errno = ENOTSUP;
+            goto err;
+        }
+
         mqhdr->mqh_pid = pid;
         mqhdr->mqh_event = *notification;
     }
